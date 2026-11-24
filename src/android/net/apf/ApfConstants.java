@@ -193,6 +193,10 @@ public final class ApfConstants {
     public static final int ICMP6_RA_CHECKSUM_LEN = 2;
     public static final int ICMP6_RA_OPTION_OFFSET =
             ETH_HEADER_LEN + IPV6_HEADER_LEN + ICMP6_RA_HEADER_LEN;
+    public static final int ICMP6_RA_FLAGS_OFFSET =
+            ETH_HEADER_LEN + IPV6_HEADER_LEN + 5;
+    public static final int ICMP6_RA_FLAG_M = 0x80;
+    public static final int ICMP6_RA_FLAG_O = 0x40;
     public static final int ICMP6_RA_ROUTER_LIFETIME_OFFSET =
             ETH_HEADER_LEN + IPV6_HEADER_LEN + 6;
     public static final int ICMP6_RA_ROUTER_LIFETIME_LEN = 2;

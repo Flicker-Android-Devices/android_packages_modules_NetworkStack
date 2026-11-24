@@ -37,8 +37,10 @@ import static android.net.ip.IpClient.IpClientCommands.CMD_DHCP6_ADDR_REG_START;
 import static android.net.ip.IpClient.IpClientCommands.CMD_DHCP6_PD_REBIND;
 import static android.net.ip.IpClient.IpClientCommands.CMD_DHCP6_PD_START;
 import static android.net.ip.IpClient.IpClientCommands.CMD_DHCP6_PD_STOP;
+import static android.net.ip.IpClient.IpClientCommands.CMD_IPV6_DAD_FAILED;
 import static android.net.ip.IpClient.IpClientCommands.CMD_JUMP_RUNNING_TO_STOPPING;
 import static android.net.ip.IpClient.IpClientCommands.CMD_JUMP_STOPPING_TO_STOPPED;
+import static android.net.ip.IpClient.IpClientCommands.CMD_RA_FLAGS_CHANGED;
 import static android.net.ip.IpClient.IpClientCommands.CMD_REMOVE_KEEPALIVE_PACKET_FILTER_FROM_APF;
 import static android.net.ip.IpClient.IpClientCommands.CMD_SET_DTIM_MULTIPLIER_AFTER_DELAY;
 import static android.net.ip.IpClient.IpClientCommands.CMD_SET_MULTICAST_FILTER;
@@ -190,6 +192,7 @@ import com.android.net.module.util.TerribleErrorLog;
 import com.android.net.module.util.arp.ArpPacket;
 import com.android.net.module.util.ip.InterfaceController;
 import com.android.net.module.util.netlink.NetlinkUtils;
+import com.android.net.module.util.structs.IaAddressOption;
 import com.android.net.module.util.structs.IaPrefixOption;
 import com.android.networkstack.R;
 import com.android.networkstack.mainline.beta.Flags;
@@ -630,6 +633,8 @@ public class IpClient extends StateMachine {
         static final int CMD_DHCP6_PD_STOP = 25;
         static final int CMD_DHCP6_PD_REBIND = 26;
         static final int CMD_DHCP6_ADDR_REG_START = 27;
+        static final int CMD_RA_FLAGS_CHANGED = 28;
+        static final int CMD_IPV6_DAD_FAILED = 29;
         // Internal commands to use instead of trying to call transitionTo() inside
         // a given State's enter() method. Calling transitionTo() from enter/exit
         // encounters a Log.wtf() that can cause trouble on eng builds.
@@ -881,6 +886,7 @@ public class IpClient extends StateMachine {
     private IpReachabilityMonitor mIpReachabilityMonitor;
     private DhcpClient mDhcpClient;
     private Dhcp6Client mDhcp6Client;
+    private final Set<Inet6Address> mDhcp6AssignedAddresses = new HashSet<>();
     private DhcpResults mDhcpResults;
     private String mTcpBufferSizes;
     private ProxyInfo mHttpProxy;
@@ -1327,6 +1333,16 @@ public class IpClient extends StateMachine {
                     @Override
                     public void startDhcp6AddrReg() {
                         sendMessage(CMD_DHCP6_ADDR_REG_START);
+                    }
+
+                    @Override
+                    public void onRaFlagsChanged(boolean mFlag, boolean oFlag) {
+                        sendMessage(CMD_RA_FLAGS_CHANGED, mFlag ? 1 : 0, oFlag ? 1 : 0);
+                    }
+
+                    @Override
+                    public void onIpv6AddressDadFailed(Inet6Address address) {
+                        sendMessage(CMD_IPV6_DAD_FAILED, address);
                     }
                 },
                 config, mLog, mDependencies
@@ -2707,14 +2723,19 @@ public class IpClient extends StateMachine {
                 && mInterfaceCtrl.enableIPv6();
     }
 
-    /** Creates Dhcp6Client and starts DHCPv6-PD. It is safe to call this function multiple times */
-    private void startDhcp6PrefixDelegation() {
+    /** Creates Dhcp6Client and starts DHCPv6. It is safe to call this function multiple times */
+    private void startDhcp6(int mode) {
         if (mDhcp6Client == null) {
             mDhcp6Client = mDependencies.makeDhcp6Client(mContext,
                     IpClient.this, mInterfaceParams, mDhcp6PacketDispatcher,
                     mDependencies.getDhcp6ClientDependencies());
         }
-        mDhcp6Client.sendMessage(Dhcp6Client.CMD_START_DHCP6);
+        mDhcp6Client.sendMessage(Dhcp6Client.CMD_START_DHCP6, mode);
+    }
+
+    /** Creates Dhcp6Client and starts DHCPv6-PD. It is safe to call this function multiple times */
+    private void startDhcp6PrefixDelegation() {
+        startDhcp6(Dhcp6Client.MODE_IA_PD);
     }
 
     private boolean applyInitialConfig(InitialConfiguration config) {
@@ -3056,6 +3077,7 @@ public class IpClient extends StateMachine {
             mGratuitousNaTargetAddresses.clear();
             mMulticastNsSourceAddresses.clear();
             mDelegatedPrefixes.clear();
+            mDhcp6AssignedAddresses.clear();
             mNudFailureEventCounts = null;
             mNudFailuresStoredSinceStart = 0;
 
@@ -3819,6 +3841,67 @@ public class IpClient extends StateMachine {
             }
         }
 
+        private void updateAssignedAddresses(@NonNull final List<IaAddressOption> valid) {
+            if (valid.isEmpty()) return;
+            final List<Inet6Address> zeroLifetimeAddresses = new ArrayList<>();
+            for (IaAddressOption addrOpt : valid) {
+                if (addrOpt.withZeroLifetimes()) {
+                    zeroLifetimeAddresses.add(addrOpt.address);
+                    continue;
+                }
+                addInterfaceAddress(addrOpt.address, addrOpt);
+                mDhcp6AssignedAddresses.add(addrOpt.address);
+            }
+            for (Inet6Address address : zeroLifetimeAddresses) {
+                Log.d(TAG, "Delete IPv6 address " + address + " with 0 preferred/valid lifetime");
+                deleteInterfaceAddress(address);
+                mDhcp6AssignedAddresses.remove(address);
+            }
+        }
+
+        private void removeExpiredAssignedAddresses(@NonNull final List<IaAddressOption> expired) {
+            if (expired.isEmpty()) return;
+            for (IaAddressOption addrOpt : expired) {
+                Log.d(TAG, "Delete expired IPv6 address " + addrOpt.address);
+                deleteInterfaceAddress(addrOpt.address);
+                mDhcp6AssignedAddresses.remove(addrOpt.address);
+            }
+        }
+
+        private void addInterfaceAddress(@Nullable final Inet6Address address,
+                @NonNull final IaAddressOption addrOpt) {
+            if (address == null) return;
+            final int flags = IFA_F_NOPREFIXROUTE;
+            final long now = SystemClock.elapsedRealtime();
+            final long deprecationTime = now + addrOpt.preferred * 1000L;
+            final long expirationTime = now + addrOpt.valid * 1000L;
+            final LinkAddress la;
+            try {
+                la = new LinkAddress(address, 128, flags,
+                        RT_SCOPE_UNIVERSE /* scope */, deprecationTime, expirationTime);
+            } catch (IllegalArgumentException e) {
+                Log.e(TAG, "Invalid IPv6 link address " + e);
+                return;
+            }
+            if (!la.isGlobalPreferred()) {
+                Log.w(TAG, la + " is not a global IPv6 address");
+                return;
+            }
+            if (!NetlinkUtils.sendRtmNewAddressRequest(mInterfaceParams.index, address,
+                    (short) 128, flags, (byte) RT_SCOPE_UNIVERSE /* scope */,
+                    addrOpt.preferred, addrOpt.valid)) {
+                Log.e(TAG, "Failed to set IPv6 address on " + address.getHostAddress()
+                        + "%" + mInterfaceParams.index);
+            }
+        }
+
+        private void deleteInterfaceAddress(final Inet6Address address) {
+            if (address == null) return;
+            if (!NetlinkUtils.sendRtmDelAddressRequest(mInterfaceParams.index, address, (short) 128)) {
+                Log.e(TAG, "Failed to delete IPv6 address " + address);
+            }
+        }
+
         @Override
         public boolean processMessage(Message msg) {
             switch (msg.what) {
@@ -3838,6 +3921,9 @@ public class IpClient extends StateMachine {
                     // roams.
                     if (mIpReachabilityMonitor != null) {
                         mIpReachabilityMonitor.probeAll(false /* dueToRoam */);
+                    }
+                    if (mDhcp6Client != null) {
+                        mDhcp6Client.sendMessage(Dhcp6Client.CMD_CONFIRM_DHCP6);
                     }
                     break;
 
@@ -4042,8 +4128,47 @@ public class IpClient extends StateMachine {
                     // and QE_DHCP6_PD_PROVISIONED are not mutually exclusive.
                     mNetworkQuirkMetrics.setEvent(QE_DHCP6_PFLAG_TRIGGERED);
                     mNetworkQuirkMetrics.statsWrite();
-                    startDhcp6PrefixDelegation();
+                    if (mDhcp6Client != null &&
+                            (mDhcp6Client.getMode() == Dhcp6Client.MODE_IA_NA ||
+                             mDhcp6Client.getMode() == Dhcp6Client.MODE_DUAL)) {
+                        startDhcp6(Dhcp6Client.MODE_DUAL);
+                    } else {
+                        startDhcp6PrefixDelegation();
+                    }
                     break;
+
+                case CMD_RA_FLAGS_CHANGED: {
+                    final boolean mFlag = msg.arg1 != 0;
+                    final boolean oFlag = msg.arg2 != 0;
+                    mLog.log("RA flags changed: M=" + mFlag + " O=" + oFlag);
+                    if (mFlag) {
+                        final int mode = (mDhcp6Client != null &&
+                                (mDhcp6Client.getMode() == Dhcp6Client.MODE_IA_PD ||
+                                 mDhcp6Client.getMode() == Dhcp6Client.MODE_DUAL))
+                                ? Dhcp6Client.MODE_DUAL : Dhcp6Client.MODE_IA_NA;
+                        startDhcp6(mode);
+                    } else if (oFlag) {
+                        if (mDhcp6Client == null ||
+                                mDhcp6Client.getMode() == Dhcp6Client.MODE_INFO_REQUEST) {
+                            startDhcp6(Dhcp6Client.MODE_INFO_REQUEST);
+                        }
+                    }
+                    break;
+                }
+
+                case CMD_IPV6_DAD_FAILED: {
+                    final Inet6Address dadFailedAddr = (Inet6Address) msg.obj;
+                    mLog.w("IPv6 address DAD failed: " + dadFailedAddr);
+                    if (mDhcp6AssignedAddresses.contains(dadFailedAddr)) {
+                        mLog.w("Declining DHCPv6 address due to DAD failure: " + dadFailedAddr);
+                        deleteInterfaceAddress(dadFailedAddr);
+                        mDhcp6AssignedAddresses.remove(dadFailedAddr);
+                        if (mDhcp6Client != null) {
+                            mDhcp6Client.sendMessage(Dhcp6Client.CMD_DECLINE_DHCP6, dadFailedAddr);
+                        }
+                    }
+                    break;
+                }
 
                 case CMD_DHCP6_PD_STOP:
                     mDhcp6Client.sendMessage(Dhcp6Client.CMD_STOP_DHCP6);
@@ -4072,6 +4197,50 @@ public class IpClient extends StateMachine {
                             removeExpiredDelegatedAddresses(toBeRemoved);
                             handleLinkPropertiesUpdate(SEND_CALLBACKS);
                             break;
+
+                        case Dhcp6Client.DHCP6_NA_SUCCESS: {
+                            final Dhcp6Client.Dhcp6Lease lease = (Dhcp6Client.Dhcp6Lease) msg.obj;
+                            updateAssignedAddresses(lease.iaAddrs);
+                            if (lease.dnsServers != null) {
+                                for (Inet6Address dns : lease.dnsServers) {
+                                    mLinkProperties.addDnsServer(dns);
+                                }
+                            }
+                            if (lease.domainList != null && !lease.domainList.isEmpty()) {
+                                mLinkProperties.setDomains(String.join(",", lease.domainList));
+                            }
+                            if (lease.ipos != null && !lease.ipos.isEmpty()) {
+                                updateDelegatedAddresses(lease.ipos);
+                            }
+                            handleLinkPropertiesUpdate(SEND_CALLBACKS);
+                            break;
+                        }
+
+                        case Dhcp6Client.DHCP6_NA_ADDRESS_EXPIRED: {
+                            if (msg.obj instanceof List<?>) {
+                                final List<IaAddressOption> expired = (List<IaAddressOption>) msg.obj;
+                                removeExpiredAssignedAddresses(expired);
+                            } else if (msg.obj instanceof Dhcp6Client.Dhcp6Lease) {
+                                final Dhcp6Client.Dhcp6Lease expiredLease = (Dhcp6Client.Dhcp6Lease) msg.obj;
+                                removeExpiredAssignedAddresses(expiredLease.iaAddrs);
+                            }
+                            handleLinkPropertiesUpdate(SEND_CALLBACKS);
+                            break;
+                        }
+
+                        case Dhcp6Client.DHCP6_INFO_SUCCESS: {
+                            final Dhcp6Client.Dhcp6Lease infoLease = (Dhcp6Client.Dhcp6Lease) msg.obj;
+                            if (infoLease.dnsServers != null) {
+                                for (Inet6Address dns : infoLease.dnsServers) {
+                                    mLinkProperties.addDnsServer(dns);
+                                }
+                            }
+                            if (infoLease.domainList != null && !infoLease.domainList.isEmpty()) {
+                                mLinkProperties.setDomains(String.join(",", infoLease.domainList));
+                            }
+                            handleLinkPropertiesUpdate(SEND_CALLBACKS);
+                            break;
+                        }
 
                         default:
                             logError("Unknown CMD_DHCP6_RESULT status: %s", msg.arg1);

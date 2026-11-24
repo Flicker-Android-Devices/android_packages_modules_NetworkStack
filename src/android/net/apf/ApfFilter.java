@@ -61,6 +61,9 @@ import static android.net.apf.ApfConstants.ICMP6_PREFIX_OPTION_VALID_LIFETIME_OF
 import static android.net.apf.ApfConstants.ICMP6_RA_CHECKSUM_LEN;
 import static android.net.apf.ApfConstants.ICMP6_RA_CHECKSUM_OFFSET;
 import static android.net.apf.ApfConstants.ICMP6_RA_FLAGS_EXTENSION_OPTION_TYPE;
+import static android.net.apf.ApfConstants.ICMP6_RA_FLAGS_OFFSET;
+import static android.net.apf.ApfConstants.ICMP6_RA_FLAG_M;
+import static android.net.apf.ApfConstants.ICMP6_RA_FLAG_O;
 import static android.net.apf.ApfConstants.ICMP6_RA_OPTION_OFFSET;
 import static android.net.apf.ApfConstants.ICMP6_RA_ROUTER_LIFETIME_LEN;
 import static android.net.apf.ApfConstants.ICMP6_RA_ROUTER_LIFETIME_OFFSET;
@@ -1130,6 +1133,9 @@ public class ApfFilter {
 
         // Router lifetime in packet
         private final int mRouterLifetime;
+        // RA Managed (M) and Other (O) configuration flags
+        private final boolean mManagedFlag;
+        private final boolean mOtherConfFlag;
         // Minimum valid lifetime of PIOs in packet, Long.MAX_VALUE means not seen.
         private final long mMinPioValidLifetime;
         // Minimum route lifetime of RIOs in packet, Long.MAX_VALUE means not seen.
@@ -1369,6 +1375,9 @@ public class ApfFilter {
 
             // Parse router lifetime
             addMatchUntil(ICMP6_RA_ROUTER_LIFETIME_OFFSET);
+            final int flags = getUint8(mPacket, ICMP6_RA_FLAGS_OFFSET);
+            mManagedFlag = (flags & ICMP6_RA_FLAG_M) != 0;
+            mOtherConfFlag = (flags & ICMP6_RA_FLAG_O) != 0;
             mRouterLifetime = getUint16(mPacket, ICMP6_RA_ROUTER_LIFETIME_OFFSET);
             addLifetimeSection(ICMP6_RA_ROUTER_LIFETIME_LEN, mRouterLifetime, mAcceptRaMinLft);
             if (mRouterLifetime == 0) mNumZeroLifetimeRas++;
@@ -1591,6 +1600,14 @@ public class ApfFilter {
             filterLifetime = Math.max(0, filterLifetime);
             // Clamp filterLifetime to <= 65535, so it fits in 2 bytes.
             return Math.min(65535, filterLifetime);
+        }
+
+        public boolean hasManagedFlag() {
+            return mManagedFlag;
+        }
+
+        public boolean hasOtherConfFlag() {
+            return mOtherConfFlag;
         }
 
         int getRaProgramLengthOverEstimate(int timeSeconds) throws IllegalInstructionException {

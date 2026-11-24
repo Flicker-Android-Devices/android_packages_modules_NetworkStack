@@ -20,11 +20,19 @@ import androidx.test.filters.SmallTest
 import androidx.test.runner.AndroidJUnit4
 import com.android.net.module.util.HexDump
 import com.android.net.module.util.dhcp6.Dhcp6AdvertisePacket
+import com.android.net.module.util.dhcp6.Dhcp6ConfirmPacket
+import com.android.net.module.util.dhcp6.Dhcp6DeclinePacket
+import com.android.net.module.util.dhcp6.Dhcp6InfoRequestPacket
 import com.android.net.module.util.dhcp6.Dhcp6Packet
+import com.android.net.module.util.dhcp6.Dhcp6ReleasePacket
 import com.android.net.module.util.dhcp6.Dhcp6ReplyPacket
 import com.android.net.module.util.dhcp6.Dhcp6SolicitPacket
+import com.android.net.module.util.structs.IaAddressOption
 import com.android.testutils.assertThrows
+import java.net.Inet6Address
+import java.net.InetAddress
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -372,5 +380,189 @@ class Dhcp6PacketTest {
         assertThrows(Dhcp6Packet.ParseException::class.java) {
             Dhcp6Packet.decode(bytes, bytes.size)
         }
+    }
+
+    @Test
+    fun testDecodeDhcp6SolicitPacket_iaNa() {
+        val solicitHex =
+            // Solicit, Transaction ID
+            "01000F51" +
+            // client identifier option(option_len=12)
+            "0001000C0003001B024CCBFFFE5F6EA9" +
+            // elapsed time option(option_len=2)
+            "000800020000" +
+            // IA_NA option(option_len=40, including IA Address option)
+            "00030028000000010000070800000B40" +
+            // IA Address option(option_len=24)
+            "0005001820010DB800000000000000000000000100000E1000001C20"
+        val bytes = HexDump.hexStringToByteArray(solicitHex)
+        val packet = Dhcp6Packet.decode(bytes, bytes.size)
+        assertTrue(packet is Dhcp6SolicitPacket)
+        assertNotNull(packet.addressAssignment)
+        assertEquals(1, packet.addressAssignment.iaid)
+        assertEquals(1800, packet.addressAssignment.t1)
+        assertEquals(2880, packet.addressAssignment.t2)
+        assertEquals(1, packet.addressAssignment.iaAddresses.size)
+        assertEquals("2001:db8::1", packet.addressAssignment.iaAddresses[0].address.hostAddress)
+        assertEquals(3600, packet.addressAssignment.iaAddresses[0].preferred)
+        assertEquals(7200, packet.addressAssignment.iaAddresses[0].valid)
+    }
+
+    @Test
+    fun testDecodeDhcp6AdvertisePacket_iaNa() {
+        val advertiseHex =
+            // Advertise, Transaction ID
+            "0200078A" +
+            // server identifier option(option_len=10)
+            "0002000A0003000186C9B26AED4D" +
+            // client identifier option(option_len=12)
+            "0001000C0003001B024CCBFFFE5F6EA9" +
+            // Preference option(option_len=1, pref=255)
+            "00070001FF" +
+            // IA_NA option(option_len=40)
+            "00030028000000010000070800000B40" +
+            // IA Address option(option_len=24)
+            "0005001820010DB800000000000000000000000100000E1000001C20" +
+            // DNS recursive name servers option(option_len=16)
+            "0017001020014860486000000000000000008888"
+        val bytes = HexDump.hexStringToByteArray(advertiseHex)
+        val packet = Dhcp6Packet.decode(bytes, bytes.size)
+        assertTrue(packet is Dhcp6AdvertisePacket)
+        assertEquals(255, packet.preference.toInt() and 0xff)
+        assertNotNull(packet.addressAssignment)
+        assertEquals(1, packet.addressAssignment.iaAddresses.size)
+        assertEquals("2001:db8::1", packet.addressAssignment.iaAddresses[0].address.hostAddress)
+        assertEquals(1, packet.dnsServers.size)
+        assertEquals("2001:4860:4860::8888", packet.dnsServers[0].hostAddress)
+    }
+
+    @Test
+    fun testDecodeDhcp6ReplyPacket_iaNa() {
+        val replyHex =
+            // Reply, Transaction ID
+            "07000A47" +
+            // server identifier option(option_len=10)
+            "0002000A0003000186C9B26AED4D" +
+            // client identifier option(option_len=12)
+            "0001000C0003001B02FBBAFFFEB7BC71" +
+            // IA_NA option(option_len=40)
+            "00030028000000010000070800000B40" +
+            // IA Address option(option_len=24)
+            "0005001820010DB800000000000000000000000100000E1000001C20" +
+            // DNS servers option(option_len=16)
+            "0017001020014860486000000000000000008888"
+        val bytes = HexDump.hexStringToByteArray(replyHex)
+        val packet = Dhcp6Packet.decode(bytes, bytes.size)
+        assertTrue(packet is Dhcp6ReplyPacket)
+        assertNotNull(packet.addressAssignment)
+        assertEquals(1, packet.addressAssignment.iaid)
+        assertEquals(1800, packet.addressAssignment.t1)
+        assertEquals(2880, packet.addressAssignment.t2)
+        assertEquals(1, packet.addressAssignment.iaAddresses.size)
+        assertEquals("2001:db8::1", packet.addressAssignment.iaAddresses[0].address.hostAddress)
+        assertEquals(3600, packet.addressAssignment.iaAddresses[0].preferred)
+        assertEquals(7200, packet.addressAssignment.iaAddresses[0].valid)
+        assertEquals(1, packet.dnsServers.size)
+        assertEquals("2001:4860:4860::8888", packet.dnsServers[0].hostAddress)
+    }
+
+    @Test
+    fun testBuildAndDecodeDhcp6Solicit_iaNa() {
+        val clientDuid = byteArrayOf(0, 3, 0, 1, 1, 2, 3, 4, 5, 6)
+        val addr = InetAddress.getByName("2001:db8::1") as Inet6Address
+        val iaAddr = IaAddressOption(addr, 3600, 7200)
+        val oro = shortArrayOf(23, 24)
+        val buf = Dhcp6Packet.buildSolicitPacket(
+            0x123456, 0, clientDuid, null, 1, listOf(iaAddr), null, oro
+        )
+        val packet = Dhcp6Packet.decode(buf.array(), buf.limit())
+        assertTrue(packet is Dhcp6SolicitPacket)
+        assertEquals(0x123456, packet.transId)
+        assertNotNull(packet.addressAssignment)
+        assertEquals(1, packet.addressAssignment.iaid)
+        assertEquals(1, packet.addressAssignment.iaAddresses.size)
+        assertEquals(addr, packet.addressAssignment.iaAddresses[0].address)
+    }
+
+    @Test
+    fun testBuildAndDecodeDhcp6DeclinePacket() {
+        val clientDuid = byteArrayOf(0, 3, 0, 1, 1, 2, 3, 4, 5, 6)
+        val serverDuid = byteArrayOf(0, 3, 0, 1, 6, 5, 4, 3, 2, 1)
+        val declinedAddr = InetAddress.getByName("2001:db8::2") as Inet6Address
+        val buf = Dhcp6Packet.buildDeclinePacket(
+            0x654321, 0, clientDuid, serverDuid, 1, declinedAddr
+        )
+        val packet = Dhcp6Packet.decode(buf.array(), buf.limit())
+        assertTrue(packet is Dhcp6DeclinePacket)
+        assertEquals(0x654321, packet.transId)
+        assertNotNull(packet.addressAssignment)
+        assertEquals(1, packet.addressAssignment.iaAddresses.size)
+        assertEquals(declinedAddr, packet.addressAssignment.iaAddresses[0].address)
+    }
+
+    @Test
+    fun testBuildAndDecodeDhcp6ConfirmPacket() {
+        val clientDuid = byteArrayOf(0, 3, 0, 1, 1, 2, 3, 4, 5, 6)
+        val addr = InetAddress.getByName("2001:db8::3") as Inet6Address
+        val iaAddr = IaAddressOption(addr, 1800, 3600)
+        val buf = Dhcp6Packet.buildConfirmPacket(
+            0xabcdef, 0, clientDuid, 1, listOf(iaAddr)
+        )
+        val packet = Dhcp6Packet.decode(buf.array(), buf.limit())
+        assertTrue(packet is Dhcp6ConfirmPacket)
+        assertEquals(0xabcdef, packet.transId)
+        assertNotNull(packet.addressAssignment)
+        assertEquals(1, packet.addressAssignment.iaAddresses.size)
+        assertEquals(addr, packet.addressAssignment.iaAddresses[0].address)
+    }
+
+    @Test
+    fun testBuildAndDecodeDhcp6ReleasePacket() {
+        val clientDuid = byteArrayOf(0, 3, 0, 1, 1, 2, 3, 4, 5, 6)
+        val serverDuid = byteArrayOf(0, 3, 0, 1, 6, 5, 4, 3, 2, 1)
+        val addr = InetAddress.getByName("2001:db8::4") as Inet6Address
+        val iaAddr = IaAddressOption(addr, 0, 0)
+        val buf = Dhcp6Packet.buildReleasePacket(
+            0x112233, 0, clientDuid, serverDuid, 1, listOf(iaAddr), null
+        )
+        val packet = Dhcp6Packet.decode(buf.array(), buf.limit())
+        assertTrue(packet is Dhcp6ReleasePacket)
+        assertEquals(0x112233, packet.transId)
+        assertNotNull(packet.addressAssignment)
+        assertEquals(1, packet.addressAssignment.iaAddresses.size)
+        assertEquals(addr, packet.addressAssignment.iaAddresses[0].address)
+    }
+
+    @Test
+    fun testBuildAndDecodeDhcp6InfoRequestPacket() {
+        val clientDuid = byteArrayOf(0, 3, 0, 1, 1, 2, 3, 4, 5, 6)
+        val oro = shortArrayOf(23, 24)
+        val buf = Dhcp6Packet.buildInfoRequestPacket(0x334455, 0, clientDuid, oro)
+        val packet = Dhcp6Packet.decode(buf.array(), buf.limit())
+        assertTrue(packet is Dhcp6InfoRequestPacket)
+        assertEquals(0x334455, packet.transId)
+    }
+
+    @Test
+    fun testDomainListEncodeAndDecode() {
+        val domains = listOf("example.com", "sub.domain.org")
+        val encoded = Dhcp6Packet.encodeDomainList(domains)
+        assertNotNull(encoded)
+        val decoded = Dhcp6Packet.decodeDomainList(java.nio.ByteBuffer.wrap(encoded))
+        assertEquals(domains, decoded)
+    }
+
+    @Test
+    fun testDomainListDecode_withCompression() {
+        val raw = byteArrayOf(
+            3, 'e'.code.toByte(), 'n'.code.toByte(), 'g'.code.toByte(),
+            5, 'a'.code.toByte(), 'p'.code.toByte(), 'p'.code.toByte(), 'l'.code.toByte(), 'e'.code.toByte(),
+            3, 'c'.code.toByte(), 'o'.code.toByte(), 'm'.code.toByte(), 0,
+            9, 'm'.code.toByte(), 'a'.code.toByte(), 'r'.code.toByte(), 'k'.code.toByte(),
+            'e'.code.toByte(), 't'.code.toByte(), 'i'.code.toByte(), 'n'.code.toByte(), 'g'.code.toByte(),
+            0xc0.toByte(), 4
+        )
+        val decoded = Dhcp6Packet.decodeDomainList(java.nio.ByteBuffer.wrap(raw))
+        assertEquals(listOf("eng.apple.com", "marketing.apple.com"), decoded)
     }
 }

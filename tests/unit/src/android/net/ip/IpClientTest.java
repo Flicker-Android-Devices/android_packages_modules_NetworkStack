@@ -29,6 +29,7 @@ import static android.system.OsConstants.RT_SCOPE_UNIVERSE;
 import static com.android.networkstack.util.NetworkStackUtils.IPCLIENT_DHCPV6_PD_PREFERRED_FLAG_VERSION;
 import static com.android.net.module.util.NetworkStackConstants.ICMPV6_ND_OPTION_PIO;
 import static com.android.net.module.util.NetworkStackConstants.ICMPV6_ROUTER_ADVERTISEMENT;
+import static com.android.net.module.util.netlink.NetlinkConstants.IFF_LOWER_UP;
 import static com.android.net.module.util.netlink.NetlinkConstants.RTM_NEWLINK;
 import static com.android.net.module.util.netlink.NetlinkConstants.RTPROT_KERNEL;
 import static com.android.net.module.util.netlink.NetlinkConstants.RTM_DELROUTE;
@@ -131,6 +132,7 @@ import com.android.testutils.HandlerUtils;
 import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
+import com.android.net.module.util.structs.IaAddressOption;
 import org.junit.runner.RunWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
@@ -391,6 +393,22 @@ public class IpClientTest {
 
     private void onInterfaceAdded(int ifaceIndex, String ifaceName) {
         final RtNetlinkLinkMessage msg = buildRtmLinkMessage(RTM_NEWLINK, ifaceIndex, ifaceName);
+        mNetlinkMessageProcessor.processNetlinkMessage(msg, TEST_UNUSED_REAL_TIME /* whenMs */);
+    }
+
+    private void onInterfaceInet6FlagsUpdated(int ifaceIndex, String ifaceName, int inet6Flags) {
+        final StructNlMsgHdr nlmsghdr =
+                makeNetlinkMessageHeader(RTM_NEWLINK, (short) (NLM_F_REQUEST | NLM_F_ACK));
+        final StructIfinfoMsg ifInfoMsg =
+                new StructIfinfoMsg(
+                        (short) OsConstants.AF_INET6,
+                        ARPHRD_ETHER,
+                        ifaceIndex,
+                        IFF_LOWER_UP /* flags */,
+                        0xffffffffL /* change */);
+
+        final RtNetlinkLinkMessage msg = RtNetlinkLinkMessage.build(
+                nlmsghdr, ifInfoMsg, 0 /* mtu */, TEST_MAC, ifaceName, inet6Flags);
         mNetlinkMessageProcessor.processNetlinkMessage(msg, TEST_UNUSED_REAL_TIME /* whenMs */);
     }
 
@@ -1565,6 +1583,69 @@ public class IpClientTest {
 
         HandlerUtils.waitForIdle(ipc.getHandler(), TEST_TIMEOUT_MS);
         verify(mDependencies, times(1)).makeDhcp6Client(any(), any(), any(), any(), any());
+
+        ipc.shutdown();
+    }
+
+    @Test
+    public void testRaFlagsChanged_managedFlagStartsDhcp6Stateful() throws Exception {
+        final IpClient ipc = doProvisioningWithDefaultConfiguration();
+
+        // 0x40 is IF_RA_MANAGED (M bit in kernel)
+        onInterfaceInet6FlagsUpdated(TEST_IFINDEX, TEST_IFNAME, 0x40);
+        HandlerUtils.waitForIdle(ipc.getHandler(), TEST_TIMEOUT_MS);
+
+        verify(mDependencies).makeDhcp6Client(any(), any(), any(), any(), any());
+        verify(mDhcp6Client).sendMessage(Dhcp6Client.CMD_START_DHCP6, Dhcp6Client.MODE_IA_NA);
+
+        ipc.shutdown();
+    }
+
+    @Test
+    public void testRaFlagsChanged_otherFlagStartsDhcp6Stateless() throws Exception {
+        final IpClient ipc = doProvisioningWithDefaultConfiguration();
+
+        // 0x80 is IF_RA_OTHERCONF (O bit in kernel)
+        onInterfaceInet6FlagsUpdated(TEST_IFINDEX, TEST_IFNAME, 0x80);
+        HandlerUtils.waitForIdle(ipc.getHandler(), TEST_TIMEOUT_MS);
+
+        verify(mDependencies).makeDhcp6Client(any(), any(), any(), any(), any());
+        verify(mDhcp6Client).sendMessage(Dhcp6Client.CMD_START_DHCP6, Dhcp6Client.MODE_INFO_REQUEST);
+
+        ipc.shutdown();
+    }
+
+    @Test
+    public void testDhcp6NaSuccess_and_DadFailure_triggersDecline() throws Exception {
+        final IpClient ipc = doProvisioningWithDefaultConfiguration();
+
+        // Start stateful DHCPv6
+        onInterfaceInet6FlagsUpdated(TEST_IFINDEX, TEST_IFNAME, 0x40);
+        HandlerUtils.waitForIdle(ipc.getHandler(), TEST_TIMEOUT_MS);
+
+        // Simulate DHCP6_NA_SUCCESS
+        final Inet6Address assignedAddr = (Inet6Address) InetAddress.getByName("2001:db8::100");
+        final IaAddressOption addrOpt = new IaAddressOption(assignedAddr, 1800, 3600);
+        final Inet6Address dnsServer = (Inet6Address) InetAddress.getByName("2001:4860:4860::8888");
+        final Dhcp6Client.Dhcp6Lease lease = new Dhcp6Client.Dhcp6Lease(
+                Collections.emptyList(),
+                Collections.singletonList(addrOpt),
+                Collections.singletonList(dnsServer),
+                Collections.singletonList("example.com")
+        );
+
+        ipc.sendMessage(Dhcp6Client.CMD_DHCP6_RESULT, Dhcp6Client.DHCP6_NA_SUCCESS, 0, lease);
+        HandlerUtils.waitForIdle(ipc.getHandler(), TEST_TIMEOUT_MS);
+
+        verify(mCb).onLinkPropertiesChange(any());
+
+        // Now simulate DAD failure on the assigned address (IFA_F_DADFAILED = 0x08)
+        final LinkAddress dadFailedLa = new LinkAddress(assignedAddr, 128, 0x08, RT_SCOPE_UNIVERSE);
+        onInterfaceAddressUpdated(dadFailedLa, 0x08 /* IFA_F_DADFAILED */);
+        HandlerUtils.waitForIdle(ipc.getHandler(), TEST_TIMEOUT_MS);
+
+        // Verify CMD_DECLINE_DHCP6 is sent to Dhcp6Client with the conflicted address
+        verify(mDhcp6Client).sendMessage(Dhcp6Client.CMD_DECLINE_DHCP6, assignedAddr);
 
         ipc.shutdown();
     }

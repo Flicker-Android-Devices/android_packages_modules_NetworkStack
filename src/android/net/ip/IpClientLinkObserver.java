@@ -18,6 +18,7 @@ package android.net.ip;
 
 import static android.system.OsConstants.AF_INET6;
 import static android.system.OsConstants.AF_UNSPEC;
+import static android.system.OsConstants.IFA_F_DADFAILED;
 import static android.system.OsConstants.IFF_LOOPBACK;
 
 import static com.android.net.module.util.NetworkStackConstants.ICMPV6_ND_OPTION_PIO;
@@ -154,6 +155,16 @@ public class IpClientLinkObserver {
          * set in the RA.
          */
         void startDhcp6AddrReg();
+
+        /**
+         * Called when RA Managed (M) or Other configuration (O) flags change.
+         */
+        default void onRaFlagsChanged(boolean mFlag, boolean oFlag) {}
+
+        /**
+         * Called when Duplicate Address Detection (DAD) fails on an assigned IPv6 address.
+         */
+        default void onIpv6AddressDadFailed(Inet6Address address) {}
     }
 
     /** Configuration parameters for IpClientLinkObserver. */
@@ -566,9 +577,14 @@ public class IpClientLinkObserver {
         if (mInet6Flags == flags) return;
         mInet6Flags = flags;
 
-        // If interface is up and M or O bit are set, start AddrReg.
+        // If interface is up, notify RA flags changed and AddrReg.
         if (!isLinkUp) return;
-        if ((flags & (IF_RA_MANAGED | IF_RA_OTHERCONF)) == 0) return;
+
+        final boolean mFlag = (flags & IF_RA_MANAGED) != 0;
+        final boolean oFlag = (flags & IF_RA_OTHERCONF) != 0;
+        mCallback.onRaFlagsChanged(mFlag, oFlag);
+
+        if (!mFlag && !oFlag) return;
 
         // Note that it is safe to call startDhcp6AddrReg() multiple times, so this code does not
         // need to check whether the M or O bits have changed or whether AddrReg had already been
@@ -636,6 +652,10 @@ public class IpClientLinkObserver {
 
         final LinkAddress la = new LinkAddress(msg.getIpAddress(), ifaddrMsg.prefixLen,
                 msg.getFlags(), ifaddrMsg.scope, deprecationTime, expirationTime);
+
+        if ((msg.getFlags() & IFA_F_DADFAILED) != 0 && la.isIpv6()) {
+            mCallback.onIpv6AddressDadFailed((Inet6Address) la.getAddress());
+        }
 
         switch (msg.getHeader().nlmsg_type) {
             case NetlinkConstants.RTM_NEWADDR:

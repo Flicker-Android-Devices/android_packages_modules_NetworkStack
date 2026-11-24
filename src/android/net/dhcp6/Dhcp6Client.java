@@ -18,6 +18,7 @@ package android.net.dhcp6;
 
 import static android.provider.DeviceConfig.NAMESPACE_CONNECTIVITY;
 
+import static com.android.net.module.util.dhcp6.Dhcp6Packet.AddressAssignment;
 import static com.android.net.module.util.dhcp6.Dhcp6Packet.IAID;
 import static com.android.net.module.util.dhcp6.Dhcp6Packet.PrefixDelegation;
 import static com.android.net.module.util.NetworkStackConstants.RFC7421_PREFIX_LENGTH;
@@ -40,9 +41,12 @@ import com.android.net.module.util.InterfaceParams;
 import com.android.net.module.util.dhcp6.Dhcp6AdvertisePacket;
 import com.android.net.module.util.dhcp6.Dhcp6Packet;
 import com.android.net.module.util.dhcp6.Dhcp6ReplyPacket;
+import com.android.net.module.util.structs.IaAddressOption;
 import com.android.net.module.util.structs.IaPrefixOption;
 
+import java.net.Inet6Address;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Random;
@@ -51,7 +55,7 @@ import java.util.function.IntSupplier;
 /**
  * A DHCPv6 client.
  *
- * So far only support IA_PD (prefix delegation), not for IA_NA/IA_TA yet.
+ * Supports IA_PD (prefix delegation) and IA_NA (non-temporary address assignment).
  *
  * @hide
  */
@@ -71,13 +75,59 @@ public class Dhcp6Client extends StateMachine {
     public static final int CMD_DHCP6_RESULT = PUBLIC_BASE + 3;
     // Commands from controller to force doing a DHCPv6 PD Rebind.
     public static final int CMD_REBIND_DHCP6 = PUBLIC_BASE + 4;
+    // Notification from DHCPv6 state machine before quitting
+    public static final int CMD_ON_QUIT = PUBLIC_BASE + 5;
+    // Commands from controller to decline an address due to DAD conflict
+    public static final int CMD_DECLINE_DHCP6 = PUBLIC_BASE + 6;
+    // Commands from controller to confirm address after roaming
+    public static final int CMD_CONFIRM_DHCP6 = PUBLIC_BASE + 7;
 
     // Message.arg1 arguments to CMD_DHCP6_RESULT notification
     public static final int DHCP6_PD_SUCCESS = 1;
     public static final int DHCP6_PD_PREFIX_EXPIRED = 2;
+    public static final int DHCP6_NA_SUCCESS = 3;
+    public static final int DHCP6_NA_ADDRESS_EXPIRED = 4;
+    public static final int DHCP6_INFO_SUCCESS = 5;
 
-    // Notification from DHCPv6 state machine before quitting
-    public static final int CMD_ON_QUIT = PUBLIC_BASE + 4;
+    // Operational modes
+    public static final int MODE_IA_PD = 1 << 0;
+    public static final int MODE_IA_NA = 1 << 1;
+    public static final int MODE_INFO_REQUEST = 1 << 2;
+    public static final int MODE_DUAL = MODE_IA_PD | MODE_IA_NA;
+
+    /**
+     * Container holding DHCPv6 lease results (prefixes, addresses, DNS servers, domain list).
+     */
+    public static class Dhcp6Lease {
+        @Nullable public final List<IaPrefixOption> ipos;
+        @Nullable public final List<IaAddressOption> iaAddrs;
+        @NonNull public final List<Inet6Address> dnsServers;
+        @NonNull public final List<String> domainList;
+
+        public Dhcp6Lease(@Nullable List<IaPrefixOption> ipos,
+                @Nullable List<IaAddressOption> iaAddrs,
+                @NonNull List<Inet6Address> dnsServers,
+                @NonNull List<String> domainList) {
+            this.ipos = ipos;
+            this.iaAddrs = iaAddrs;
+            this.dnsServers = dnsServers;
+            this.domainList = domainList;
+        }
+
+        public boolean hasPrefixDelegation() {
+            return ipos != null && !ipos.isEmpty();
+        }
+
+        public boolean hasAddressAssignment() {
+            return iaAddrs != null && !iaAddrs.isEmpty();
+        }
+
+        @Override
+        public String toString() {
+            return "Dhcp6Lease{prefixes=" + ipos + ", addrs=" + iaAddrs
+                    + ", dns=" + dnsServers + ", domains=" + domainList + "}";
+        }
+    }
 
     // Internal messages.
     private static final int PRIVATE_BASE        = IpClient.DHCP6CLIENT_CMD_BASE + 100;
@@ -101,8 +151,13 @@ public class Dhcp6Client extends StateMachine {
 
     private int mSolMaxRtMs = SOL_MAX_RT;
 
-    @Nullable private PrefixDelegation mAdvertise;
-    @Nullable private PrefixDelegation mReply;
+    private int mMode = MODE_IA_PD;
+    @Nullable private PrefixDelegation mAdvertisePd;
+    @Nullable private PrefixDelegation mReplyPd;
+    @Nullable private AddressAssignment mAdvertiseAa;
+    @Nullable private AddressAssignment mReplyAa;
+    @NonNull private final List<Inet6Address> mDnsServers = new ArrayList<>();
+    @NonNull private final List<String> mDomainList = new ArrayList<>();
     @Nullable private byte[] mServerDuid;
 
     // State variables.
@@ -124,6 +179,7 @@ public class Dhcp6Client extends StateMachine {
     private State mStartedState = new StartedState();
     private State mSolicitState = new SolicitState();
     private State mRequestState = new RequestState();
+    private State mInfoRequestState = new InfoRequestState();
     private State mHaveLeaseState = new HaveLeaseState();
     private State mBoundState = new BoundState();
     private State mRenewState = new RenewState();
@@ -168,6 +224,7 @@ public class Dhcp6Client extends StateMachine {
         addState(mStartedState); {
             addState(mSolicitState, mStartedState);
             addState(mRequestState, mStartedState);
+            addState(mInfoRequestState, mStartedState);
             addState(mHaveLeaseState, mStartedState); {
                 addState(mBoundState, mHaveLeaseState);
                 addState(mRenewState, mHaveLeaseState);
@@ -185,6 +242,13 @@ public class Dhcp6Client extends StateMachine {
         mRenewAlarm = makeWakeupMessage("RENEW", CMD_DHCP6_PD_RENEW);
         mRebindAlarm = makeWakeupMessage("REBIND", CMD_DHCP6_PD_REBIND);
         mExpiryAlarm = makeWakeupMessage("EXPIRY", CMD_DHCP6_PD_EXPIRE);
+    }
+
+    /**
+     * Get current DHCPv6 operation mode.
+     */
+    public int getMode() {
+        return mMode;
     }
 
     /**
@@ -275,7 +339,7 @@ public class Dhcp6Client extends StateMachine {
             // prefix, e.g. the list of prefix is empty). However, if prefix(es) do exist and all
             // prefixes are invalid, then we should just ignore this packet.
             if (!packet.isValid(mTransId, mClientDuid)) return;
-            if (!packet.getPrefixDelegation().ipos.isEmpty()) {
+            if (packet.getPrefixDelegation() != null && !packet.getPrefixDelegation().ipos.isEmpty()) {
                 boolean allInvalidPrefixes = true;
                 for (IaPrefixOption ipo : packet.getPrefixDelegation().ipos) {
                     if (ipo != null && ipo.isValid()) {
@@ -285,6 +349,20 @@ public class Dhcp6Client extends StateMachine {
                 }
                 if (allInvalidPrefixes) {
                     Log.w(TAG, "All IA_Prefix options included in the "
+                            + packet.getClass().getSimpleName() + " are invalid, ignore it.");
+                    return;
+                }
+            }
+            if (packet.getAddressAssignment() != null && !packet.getAddressAssignment().iaAddrs.isEmpty()) {
+                boolean allInvalidAddresses = true;
+                for (IaAddressOption iao : packet.getAddressAssignment().iaAddrs) {
+                    if (iao != null && iao.isValid()) {
+                        allInvalidAddresses = false;
+                        break;
+                    }
+                }
+                if (allInvalidAddresses) {
+                    Log.w(TAG, "All IA_Address options included in the "
                             + packet.getClass().getSimpleName() + " are invalid, ignore it.");
                     return;
                 }
@@ -370,18 +448,39 @@ public class Dhcp6Client extends StateMachine {
     }
 
     private void scheduleLeaseTimers() {
-        // TODO: validate t1, t2, valid and preferred lifetimes before the timers are scheduled
-        // to prevent packet storms due to low timeouts. Preferred/valid lifetime of 0 should be
-        // excluded before scheduling the lease timer.
-        int renewTimeout = mReply.t1;
-        int rebindTimeout = mReply.t2;
-        final long deprecationTimeout = mReply.getMinimalPreferredLifetime();
-        final long expirationTimeout = mReply.getMinimalValidLifetime();
+        int renewTimeout = 0;
+        int rebindTimeout = 0;
+        long deprecationTimeout = Long.MAX_VALUE;
+        long expirationTimeout = Long.MAX_VALUE;
+
+        if (mReplyPd != null) {
+            renewTimeout = mReplyPd.t1;
+            rebindTimeout = mReplyPd.t2;
+            deprecationTimeout = Math.min(deprecationTimeout, mReplyPd.getMinimalPreferredLifetime());
+            expirationTimeout = Math.min(expirationTimeout, mReplyPd.getMinimalValidLifetime());
+        }
+
+        if (mReplyAa != null) {
+            final int naT1 = mReplyAa.t1;
+            final int naT2 = mReplyAa.t2;
+            if (renewTimeout == 0 || (naT1 > 0 && naT1 < renewTimeout)) {
+                renewTimeout = naT1;
+            }
+            if (rebindTimeout == 0 || (naT2 > 0 && naT2 < rebindTimeout)) {
+                rebindTimeout = naT2;
+            }
+            deprecationTimeout = Math.min(deprecationTimeout, mReplyAa.getMinimalPreferredLifetime());
+            expirationTimeout = Math.min(expirationTimeout, mReplyAa.getMinimalValidLifetime());
+        }
+
+        if (expirationTimeout == Long.MAX_VALUE) {
+            Log.w(TAG, "No valid lease found to schedule timers");
+            return;
+        }
 
         // rfc8415#section-14.2: if t1 and / or t2 are 0, the client chooses an appropriate value.
         // rfc8415#section-21.21: Recommended values for T1 and T2 are 0.5 and 0.8 times the
-        // shortest preferred lifetime of the prefixes in the IA_PD that the server is willing to
-        // extend, respectively.
+        // shortest preferred lifetime of the leases, respectively.
         if (renewTimeout == 0) {
             renewTimeout = (int) (deprecationTimeout * 0.5);
         }
@@ -389,16 +488,6 @@ public class Dhcp6Client extends StateMachine {
             rebindTimeout = (int) (deprecationTimeout * 0.8);
         }
 
-        // Note: message validation asserts that the received t1 <= t2 if both t1 > 0 and t2 > 0.
-        // However, if t1 or t2 are 0, it is possible for renewTimeout to become larger than
-        // rebindTimeout (and similarly, rebindTimeout to become larger than expirationTimeout).
-        // For example: t1 = 0, t2 = 40, valid lft = 100 results in renewTimeout = 50, and
-        // rebindTimeout = 40. Hence, their correct order must be asserted below.
-
-        // If timeouts happen to coincide or are out of order, the former (in respect to the
-        // specified provisioning lifecycle) can be skipped. This also takes care of the case where
-        // the server sets t1 == t2 == valid lft, which indicates that the IA cannot be renewed, so
-        // there is no point in trying.
         if (renewTimeout >= rebindTimeout) {
             // skip RENEW
             renewTimeout = 0;
@@ -411,53 +500,111 @@ public class Dhcp6Client extends StateMachine {
         final long now = SystemClock.elapsedRealtime();
         if (renewTimeout > 0) {
             mRenewAlarm.schedule(now + renewTimeout * (long) SECONDS);
-            Log.d(TAG, "Scheduling IA_PD renewal in " + renewTimeout + "s");
+            Log.d(TAG, "Scheduling DHCPv6 renewal in " + renewTimeout + "s");
         }
         if (rebindTimeout > 0) {
             mRebindAlarm.schedule(now + rebindTimeout * (long) SECONDS);
-            Log.d(TAG, "Scheduling IA_PD rebind in " + rebindTimeout + "s");
+            Log.d(TAG, "Scheduling DHCPv6 rebind in " + rebindTimeout + "s");
         }
         mExpiryAlarm.schedule(now + expirationTimeout * (long) SECONDS);
-        Log.d(TAG, "Scheduling IA_PD expiry in " + expirationTimeout + "s");
+        Log.d(TAG, "Scheduling DHCPv6 expiry in " + expirationTimeout + "s");
     }
 
     private void notifyPrefixDelegation(int result, @Nullable final List<IaPrefixOption> ipos) {
         mController.sendMessage(CMD_DHCP6_RESULT, result, 0, ipos);
     }
 
+    private void notifyLease(int result, @NonNull final Dhcp6Lease lease) {
+        mController.sendMessage(CMD_DHCP6_RESULT, result, 0, lease);
+    }
+
     private void clearDhcp6State() {
-        mAdvertise = null;
-        mReply = null;
+        mAdvertisePd = null;
+        mReplyPd = null;
+        mAdvertiseAa = null;
+        mReplyAa = null;
+        mDnsServers.clear();
+        mDomainList.clear();
         mServerDuid = null;
         mSolMaxRtMs = SOL_MAX_RT;
     }
 
     @SuppressWarnings("ByteBufferBackingArray")
-    private boolean sendSolicitPacket(int transId, long elapsedTimeMs, final ByteBuffer iapd) {
+    private boolean sendSolicitPacket(int transId, long elapsedTimeMs,
+            @Nullable final ByteBuffer iapd, @Nullable final ByteBuffer iana) {
         final ByteBuffer packet = Dhcp6Packet.buildSolicitPacket(transId, elapsedTimeMs,
-                iapd.array(), mClientDuid, true /* rapidCommit */);
+                mClientDuid,
+                iapd != null ? iapd.array() : null,
+                iana != null ? iana.array() : null,
+                true /* rapidCommit */);
         return transmitPacket(packet, "solicit");
     }
 
     @SuppressWarnings("ByteBufferBackingArray")
-    private boolean sendRequestPacket(int transId, long elapsedTimeMs, final ByteBuffer iapd) {
+    private boolean sendRequestPacket(int transId, long elapsedTimeMs,
+            @Nullable final ByteBuffer iapd, @Nullable final ByteBuffer iana) {
         final ByteBuffer packet = Dhcp6Packet.buildRequestPacket(transId, elapsedTimeMs,
-                iapd.array(), mClientDuid, mServerDuid);
+                mClientDuid, mServerDuid,
+                iapd != null ? iapd.array() : null,
+                iana != null ? iana.array() : null);
         return transmitPacket(packet, "request");
     }
 
     @SuppressWarnings("ByteBufferBackingArray")
-    private boolean sendRenewPacket(int transId, long elapsedTimeMs, final ByteBuffer iapd) {
+    private boolean sendRenewPacket(int transId, long elapsedTimeMs,
+            @Nullable final ByteBuffer iapd, @Nullable final ByteBuffer iana) {
         final ByteBuffer packet = Dhcp6Packet.buildRenewPacket(transId, elapsedTimeMs,
-                iapd.array(), mClientDuid, mServerDuid);
+                mClientDuid, mServerDuid,
+                iapd != null ? iapd.array() : null,
+                iana != null ? iana.array() : null);
         return transmitPacket(packet, "renew");
     }
 
     @SuppressWarnings("ByteBufferBackingArray")
-    private boolean sendRebindPacket(int transId, long elapsedTimeMs, final ByteBuffer iapd) {
+    private boolean sendRebindPacket(int transId, long elapsedTimeMs,
+            @Nullable final ByteBuffer iapd, @Nullable final ByteBuffer iana) {
         final ByteBuffer packet = Dhcp6Packet.buildRebindPacket(transId, elapsedTimeMs,
-                iapd.array(), mClientDuid);
+                mClientDuid,
+                iapd != null ? iapd.array() : null,
+                iana != null ? iana.array() : null);
         return transmitPacket(packet, "rebind");
+    }
+
+    @SuppressWarnings("ByteBufferBackingArray")
+    private boolean sendDeclinePacket(int transId, long elapsedTimeMs,
+            @NonNull final Inet6Address addr) {
+        final IaAddressOption declOption = new IaAddressOption(
+                (short) IaAddressOption.LENGTH, addr, 0, 0);
+        final AddressAssignment aa = new AddressAssignment(
+                IAID, 0, 0, Collections.singletonList(declOption));
+        final ByteBuffer packet = Dhcp6Packet.buildDeclinePacket(transId, elapsedTimeMs,
+                mClientDuid, mServerDuid, aa.build().array());
+        return transmitPacket(packet, "decline");
+    }
+
+    @SuppressWarnings("ByteBufferBackingArray")
+    private boolean sendConfirmPacket(int transId, long elapsedTimeMs,
+            @NonNull final List<IaAddressOption> addrs) {
+        final AddressAssignment aa = new AddressAssignment(IAID, 0, 0, addrs);
+        final ByteBuffer packet = Dhcp6Packet.buildConfirmPacket(transId, elapsedTimeMs,
+                mClientDuid, aa.build().array());
+        return transmitPacket(packet, "confirm");
+    }
+
+    @SuppressWarnings("ByteBufferBackingArray")
+    private boolean sendReleasePacket(int transId, long elapsedTimeMs,
+            @NonNull final List<IaAddressOption> addrs) {
+        final AddressAssignment aa = new AddressAssignment(IAID, 0, 0, addrs);
+        final ByteBuffer packet = Dhcp6Packet.buildReleasePacket(transId, elapsedTimeMs,
+                mClientDuid, mServerDuid, aa.build().array());
+        return transmitPacket(packet, "release");
+    }
+
+    @SuppressWarnings("ByteBufferBackingArray")
+    private boolean sendInfoRequestPacket(int transId, long elapsedTimeMs) {
+        final ByteBuffer packet = Dhcp6Packet.buildInfoRequestPacket(transId, elapsedTimeMs,
+                mClientDuid);
+        return transmitPacket(packet, "information-request");
     }
 
     /**
@@ -489,6 +636,22 @@ public class Dhcp6Client extends StateMachine {
                 case CMD_STOP_DHCP6:
                     transitionTo(mStoppedState);
                     return HANDLED;
+                case CMD_START_DHCP6: {
+                    final int newMode = (message.arg1 != 0) ? message.arg1 : MODE_IA_PD;
+                    if (newMode == mMode) {
+                        return HANDLED;
+                    }
+                    if (mMode == MODE_INFO_REQUEST && (newMode == MODE_IA_NA || newMode == MODE_DUAL)) {
+                        mMode = newMode;
+                        transitionTo(mSolicitState);
+                    } else if ((mMode == MODE_IA_PD && newMode == MODE_IA_NA)
+                            || (mMode == MODE_IA_NA && newMode == MODE_IA_PD)
+                            || newMode == MODE_DUAL) {
+                        mMode = MODE_DUAL;
+                        transitionTo(mSolicitState);
+                    }
+                    return HANDLED;
+                }
                 default:
                     return NOT_HANDLED;
             }
@@ -503,9 +666,12 @@ public class Dhcp6Client extends StateMachine {
         public boolean processMessage(Message message) {
             switch (message.what) {
                 case CMD_START_DHCP6:
-                    // TODO: store the delegated prefix in IpMemoryStore and start in REBIND instead
-                    // of SOLICIT if there is already a valid prefix on this network.
-                    transitionTo(mSolicitState);
+                    mMode = (message.arg1 != 0) ? message.arg1 : MODE_IA_PD;
+                    if (mMode == MODE_INFO_REQUEST) {
+                        transitionTo(mInfoRequestState);
+                    } else {
+                        transitionTo(mSolicitState);
+                    }
                     return HANDLED;
                 default:
                     return NOT_HANDLED;
@@ -534,26 +700,40 @@ public class Dhcp6Client extends StateMachine {
 
         @Override
         protected boolean sendPacket(int transId, long elapsedTimeMs) {
-            final IaPrefixOption hintOption = new IaPrefixOption((short) IaPrefixOption.LENGTH,
-                    0 /* preferred */, 0 /* valid */, (byte) RFC7421_PREFIX_LENGTH,
-                    new byte[16] /* empty prefix */);
-            final PrefixDelegation pd = new PrefixDelegation(IAID, 0 /* t1 */, 0 /* t2 */,
-                    Collections.singletonList(hintOption));
-            return sendSolicitPacket(transId, elapsedTimeMs, pd.build());
+            final ByteBuffer pdBuf = (mMode & MODE_IA_PD) != 0
+                    ? new PrefixDelegation(IAID, 0, 0,
+                            Collections.singletonList(new IaPrefixOption((short) IaPrefixOption.LENGTH,
+                                    0, 0, (byte) RFC7421_PREFIX_LENGTH, new byte[16]))).build()
+                    : null;
+            final ByteBuffer naBuf = (mMode & MODE_IA_NA) != 0
+                    ? new AddressAssignment(IAID, 0, 0, Collections.emptyList()).build()
+                    : null;
+            return sendSolicitPacket(transId, elapsedTimeMs, pdBuf, naBuf);
         }
 
         @Override
         protected void receivePacket(Dhcp6Packet packet) {
             final PrefixDelegation pd = packet.getPrefixDelegation();
-            // Ignore any Advertise or Reply for Solicit(with Rapid Commit) with NoPrefixAvail
-            // status code, retransmit Solicit to see if any valid response from other Servers.
-            if (pd.statusCode == Dhcp6Packet.STATUS_NO_PREFIX_AVAIL) {
+            final AddressAssignment aa = packet.getAddressAssignment();
+
+            if (pd != null && pd.statusCode == Dhcp6Packet.STATUS_NO_PREFIX_AVAIL) {
                 Log.w(TAG, "Server responded to Solicit without available prefix, ignoring");
                 return;
             }
+            if (aa != null && aa.statusCode == Dhcp6Packet.STATUS_NO_ADDRS_AVAIL) {
+                Log.w(TAG, "Server responded to Solicit without available address, ignoring");
+                return;
+            }
+
+            mDnsServers.clear();
+            mDnsServers.addAll(packet.getDnsServers());
+            mDomainList.clear();
+            mDomainList.addAll(packet.getDomainList());
+
             if (packet instanceof Dhcp6AdvertisePacket) {
-                Log.d(TAG, "Get prefix delegation option from Advertise: " + pd);
-                mAdvertise = pd;
+                Log.d(TAG, "Get lease options from Advertise: pd=" + pd + ", aa=" + aa);
+                mAdvertisePd = pd;
+                mAdvertiseAa = aa;
                 mServerDuid = packet.getServerDuid();
                 mSolMaxRtMs = packet.getSolMaxRtMs().orElse(mSolMaxRtMs);
                 transitionTo(mRequestState);
@@ -563,8 +743,9 @@ public class Dhcp6Client extends StateMachine {
                             + ", ignoring");
                     return;
                 }
-                Log.d(TAG, "Get prefix delegation option from RapidCommit Reply: " + pd);
-                mReply = pd;
+                Log.d(TAG, "Get lease options from RapidCommit Reply: pd=" + pd + ", aa=" + aa);
+                mReplyPd = pd;
+                mReplyAa = aa;
                 mServerDuid = packet.getServerDuid();
                 mSolMaxRtMs = packet.getSolMaxRtMs().orElse(mSolMaxRtMs);
                 transitionTo(mBoundState);
@@ -584,20 +765,33 @@ public class Dhcp6Client extends StateMachine {
 
         @Override
         protected boolean sendPacket(int transId, long elapsedTimeMs) {
-            return sendRequestPacket(transId, elapsedTimeMs, mAdvertise.build());
+            final ByteBuffer pdBuf = mAdvertisePd != null ? mAdvertisePd.build() : null;
+            final ByteBuffer naBuf = mAdvertiseAa != null ? mAdvertiseAa.build() : null;
+            return sendRequestPacket(transId, elapsedTimeMs, pdBuf, naBuf);
         }
 
         @Override
         protected void receivePacket(Dhcp6Packet packet) {
             if (!(packet instanceof Dhcp6ReplyPacket)) return;
             final PrefixDelegation pd = packet.getPrefixDelegation();
-            if (pd.statusCode == Dhcp6Packet.STATUS_NO_PREFIX_AVAIL) {
+            final AddressAssignment aa = packet.getAddressAssignment();
+            if (pd != null && pd.statusCode == Dhcp6Packet.STATUS_NO_PREFIX_AVAIL) {
                 Log.w(TAG, "Server responded to Request without available prefix, restart Solicit");
                 transitionTo(mSolicitState);
                 return;
             }
-            Log.d(TAG, "Get prefix delegation option from Reply: " + pd);
-            mReply = pd;
+            if (aa != null && aa.statusCode == Dhcp6Packet.STATUS_NO_ADDRS_AVAIL) {
+                Log.w(TAG, "Server responded to Request without available address, restart Solicit");
+                transitionTo(mSolicitState);
+                return;
+            }
+            Log.d(TAG, "Get lease options from Reply: pd=" + pd + ", aa=" + aa);
+            mReplyPd = pd;
+            mReplyAa = aa;
+            mDnsServers.clear();
+            mDnsServers.addAll(packet.getDnsServers());
+            mDomainList.clear();
+            mDomainList.addAll(packet.getDomainList());
             mSolMaxRtMs = packet.getSolMaxRtMs().orElse(mSolMaxRtMs);
             transitionTo(mBoundState);
         }
@@ -616,7 +810,15 @@ public class Dhcp6Client extends StateMachine {
         public boolean processMessage(Message message) {
             switch (message.what) {
                 case CMD_DHCP6_PD_EXPIRE:
-                    notifyPrefixDelegation(DHCP6_PD_PREFIX_EXPIRED, mReply.getValidIaPrefixes());
+                    final Dhcp6Lease expiredLease = new Dhcp6Lease(
+                            mReplyPd != null ? mReplyPd.getValidIaPrefixes() : null,
+                            mReplyAa != null ? mReplyAa.getValidIaAddresses() : null,
+                            Collections.emptyList(), Collections.emptyList());
+                    if (mMode == MODE_IA_PD) {
+                        notifyPrefixDelegation(DHCP6_PD_PREFIX_EXPIRED, expiredLease.ipos);
+                    } else {
+                        notifyLease(DHCP6_NA_ADDRESS_EXPIRED, expiredLease);
+                    }
                     transitionTo(mSolicitState);
                     return HANDLED;
                 default:
@@ -635,17 +837,23 @@ public class Dhcp6Client extends StateMachine {
     }
 
     /**
-     * Client has already obtained the lease(e.g. IA_PD option) from server and stays in Bound
-     * state until T1 expires, and then transition to Renew state to extend the lease duration.
+     * Client has already obtained the lease from server and stays in Bound state until T1 expires.
      */
     class BoundState extends State {
         @Override
         public void enter() {
             super.enter();
             scheduleLeaseTimers();
-            // Pass valid delegated prefix(es) to IpClient for IPv6 address configuration and
-            // active prefix(es) maintenance.
-            notifyPrefixDelegation(DHCP6_PD_SUCCESS, mReply.getValidIaPrefixes());
+            final Dhcp6Lease lease = new Dhcp6Lease(
+                    mReplyPd != null ? mReplyPd.getValidIaPrefixes() : null,
+                    mReplyAa != null ? mReplyAa.getValidIaAddresses() : null,
+                    new ArrayList<>(mDnsServers),
+                    new ArrayList<>(mDomainList));
+            if (mMode == MODE_IA_PD) {
+                notifyPrefixDelegation(DHCP6_PD_SUCCESS, lease.ipos);
+            } else {
+                notifyLease(DHCP6_NA_SUCCESS, lease);
+            }
         }
 
         @Override
@@ -658,6 +866,16 @@ public class Dhcp6Client extends StateMachine {
                 case CMD_REBIND_DHCP6:
                     transitionTo(mRebindState);
                     return HANDLED;
+                case CMD_DECLINE_DHCP6:
+                    final Inet6Address declinedAddr = (Inet6Address) message.obj;
+                    sendDeclinePacket((mRandom.nextInt() & 0xffffff), 0, declinedAddr);
+                    transitionTo(mSolicitState);
+                    return HANDLED;
+                case CMD_CONFIRM_DHCP6:
+                    if (mReplyAa != null && !mReplyAa.getValidIaAddresses().isEmpty()) {
+                        sendConfirmPacket((mRandom.nextInt() & 0xffffff), 0, mReplyAa.getValidIaAddresses());
+                    }
+                    return HANDLED;
                 default:
                     return NOT_HANDLED;
             }
@@ -665,24 +883,7 @@ public class Dhcp6Client extends StateMachine {
     }
 
     /**
-     *  Per RFC8415 section 18.2.10.1: Reply for renew or Rebind.
-     * - If all binding IA_PDs were renewed/rebound(so far we only support one IA_PD option per
-     *   interface), then move to BoundState to update the existing global IPv6 addresses lifetime
-     *   or install new global IPv6 address depending on the response from server.
-     * - Server may add new IA prefix option in Reply message(e.g. due to renumbering events), or
-     *   may choose to deprecate some prefixes if it cannot extend the lifetime by:
-     *     - either not including these requested IA prefixes in Reply message
-     *     - or setting the valid lifetime equals to T1/T2
-     *   That forces previous delegated prefixes to expire in a natural way, and client should
-     *   also stop trying to extend the lifetime for them. That being said, the global IPv6 address
-     *   lifetime won't be updated in BoundState if corresponding prefix doesn't appear in Reply
-     *   message, resulting in these global IPv6 addresses expire eventually and IpClient obtains
-     *   these updates via netlink message and remove the delegated prefix(es) from LinkProperties.
-     * - If some binding IA_PDs were absent in Reply message, client should still stay at RenewState
-     *   or RebindState and retransmit Renew/Rebind messages to see if it can get all later. So far
-     *   we only support one IA_PD option per interface, if the received Reply message doesn't take
-     *   any IA_Prefix option, then treat it as if IA_PD is absent, since there's no point in
-     *   returning BoundState again.
+     * Per RFC8415 section 18.2.10.1: Reply for Renew or Rebind.
      */
     abstract class ReacquireState extends MessageExchangeState {
         ReacquireState(final int irt, final int mrt) {
@@ -698,32 +899,34 @@ public class Dhcp6Client extends StateMachine {
         protected void receivePacket(Dhcp6Packet packet) {
             if (!(packet instanceof Dhcp6ReplyPacket)) return;
             final PrefixDelegation pd = packet.getPrefixDelegation();
-            // Stay at Renew/Rebind state if the Reply message takes NoPrefixAvail status code,
-            // retransmit Renew/Rebind message to server, to retry obtaining the prefixes.
-            if (pd.statusCode == Dhcp6Packet.STATUS_NO_PREFIX_AVAIL) {
+            final AddressAssignment aa = packet.getAddressAssignment();
+
+            if (pd != null && pd.statusCode == Dhcp6Packet.STATUS_NO_PREFIX_AVAIL) {
                 Log.w(TAG, "Server responded to Renew/Rebind without available prefix, ignoring");
                 return;
             }
-            // TODO: send a Request message to the server that responded if any of the IA_PDs in
-            // Reply message contain NoBinding status code.
-            Log.d(TAG, "Get prefix delegation option from Reply as response to Renew/Rebind " + pd);
-            if (pd.ipos.isEmpty()) return;
-            mReply = pd;
+            if (aa != null && aa.statusCode == Dhcp6Packet.STATUS_NO_ADDRS_AVAIL) {
+                Log.w(TAG, "Server responded to Renew/Rebind without available address, ignoring");
+                return;
+            }
+
+            Log.d(TAG, "Get lease options from Reply as response to Renew/Rebind pd=" + pd + ", aa=" + aa);
+            if ((pd == null || pd.ipos.isEmpty()) && (aa == null || aa.iaAddrs.isEmpty())) {
+                return;
+            }
+            if (pd != null) mReplyPd = pd;
+            if (aa != null) mReplyAa = aa;
+            mDnsServers.clear();
+            mDnsServers.addAll(packet.getDnsServers());
+            mDomainList.clear();
+            mDomainList.addAll(packet.getDomainList());
             mServerDuid = packet.getServerDuid();
-            // Once the delegated prefix gets refreshed successfully we have to extend the
-            // preferred lifetime and valid lifetime of global IPv6 addresses, otherwise
-            // these addresses will become depreacated finally and then provisioning failure
-            // happens. So we transit to mBoundState to update the address with refreshed
-            // preferred and valid lifetime via sending RTM_NEWADDR message, going back to
-            // Bound state after a success update.
             transitionTo(mBoundState);
         }
     }
 
     /**
-     * Client enters Renew state when T1 expires and (re)transmits Renew message to the
-     * server that originally provided the client's leases and configuration parameters to
-     * extend the lifetimes on the leases assigned to the client.
+     * Client enters Renew state when T1 expires.
      */
     class RenewState extends ReacquireState {
         RenewState() {
@@ -746,19 +949,22 @@ public class Dhcp6Client extends StateMachine {
 
         @Override
         protected boolean sendPacket(int transId, long elapsedTimeMs) {
-            final List<IaPrefixOption> toBeRenewed = mReply.getRenewableIaPrefixes();
-            if (toBeRenewed.isEmpty()) {
-                if (DBG) Log.d(TAG, "Do not send Renew message due to no renewable prefix.");
+            final List<IaPrefixOption> toBeRenewedPd = mReplyPd != null
+                    ? mReplyPd.getRenewableIaPrefixes() : Collections.emptyList();
+            final List<IaAddressOption> toBeRenewedAa = mReplyAa != null
+                    ? mReplyAa.getRenewableIaAddresses() : Collections.emptyList();
+            if (toBeRenewedPd.isEmpty() && toBeRenewedAa.isEmpty()) {
+                if (DBG) Log.d(TAG, "Do not send Renew message due to no renewable prefix or address.");
                 return false;
             }
-            return sendRenewPacket(transId, elapsedTimeMs, mReply.build(toBeRenewed));
+            final ByteBuffer pdBuf = !toBeRenewedPd.isEmpty() ? mReplyPd.build(toBeRenewedPd) : null;
+            final ByteBuffer naBuf = !toBeRenewedAa.isEmpty() ? mReplyAa.build(toBeRenewedAa) : null;
+            return sendRenewPacket(transId, elapsedTimeMs, pdBuf, naBuf);
         }
     }
 
     /**
-     * Client enters Rebind state when T2 expires and (re)transmits Rebind message to any
-     * available server to extend the lifetimes on the leases assigned to the client and to
-     * update other configuration parameters.
+     * Client enters Rebind state when T2 expires.
      */
     class RebindState extends ReacquireState {
         RebindState() {
@@ -774,12 +980,51 @@ public class Dhcp6Client extends StateMachine {
 
         @Override
         protected boolean sendPacket(int transId, long elapsedTimeMs) {
-            final List<IaPrefixOption> toBeRebound = mReply.getRenewableIaPrefixes();
-            if (toBeRebound.isEmpty()) {
-                if (DBG) Log.d(TAG, "Do not send Rebind message due to no renewable prefix.");
+            final List<IaPrefixOption> toBeReboundPd = mReplyPd != null
+                    ? mReplyPd.getRenewableIaPrefixes() : Collections.emptyList();
+            final List<IaAddressOption> toBeReboundAa = mReplyAa != null
+                    ? mReplyAa.getRenewableIaAddresses() : Collections.emptyList();
+            if (toBeReboundPd.isEmpty() && toBeReboundAa.isEmpty()) {
+                if (DBG) Log.d(TAG, "Do not send Rebind message due to no renewable prefix or address.");
                 return false;
             }
-            return sendRebindPacket(transId, elapsedTimeMs, mReply.build(toBeRebound));
+            final ByteBuffer pdBuf = !toBeReboundPd.isEmpty() ? mReplyPd.build(toBeReboundPd) : null;
+            final ByteBuffer naBuf = !toBeReboundAa.isEmpty() ? mReplyAa.build(toBeReboundAa) : null;
+            return sendRebindPacket(transId, elapsedTimeMs, pdBuf, naBuf);
+        }
+    }
+
+    /**
+     * Stateless DHCPv6: client transmits Information-Request and receives configuration parameters.
+     */
+    class InfoRequestState extends MessageExchangeState {
+        InfoRequestState() {
+            super(0 /* delay */, SOL_TIMEOUT /* IRT */, 5 /* MRC */, () -> mSolMaxRtMs /* MRT */);
+        }
+
+        @Override
+        protected boolean sendPacket(int transId, long elapsedTimeMs) {
+            return sendInfoRequestPacket(transId, elapsedTimeMs);
+        }
+
+        @Override
+        protected void receivePacket(Dhcp6Packet packet) {
+            if (!(packet instanceof Dhcp6ReplyPacket)) return;
+            Log.d(TAG, "Get DNS/Domain options from Info-Request Reply: " + packet.getDnsServers());
+            mDnsServers.clear();
+            mDnsServers.addAll(packet.getDnsServers());
+            mDomainList.clear();
+            mDomainList.addAll(packet.getDomainList());
+            final Dhcp6Lease lease = new Dhcp6Lease(null, null,
+                    new ArrayList<>(mDnsServers), new ArrayList<>(mDomainList));
+            notifyLease(DHCP6_INFO_SUCCESS, lease);
+            transitionTo(mStoppedState);
+        }
+
+        @Override
+        protected void onMessageExchangeFailed() {
+            Log.w(TAG, "Information-Request failed");
+            transitionTo(mStoppedState);
         }
     }
 
